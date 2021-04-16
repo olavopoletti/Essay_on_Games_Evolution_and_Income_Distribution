@@ -1,0 +1,498 @@
+import numpy as np
+import pandas as pd
+import gc
+from dask import dataframe as dd
+from distributed import Client, progress, LocalCluster
+import os
+from fastparquet import write
+cluster = LocalCluster()
+client = Client(cluster) #processes = False
+
+mem = '500MB' #partition_size
+mem_target = 100000
+
+scenario_a = ['N400h100T0.8U0.6UM0.4M0gap0.02', 'A']
+scenario_b = ['N100h100T0.8U0.6UM0.4M0gap0.02', 'B']
+scenario_c = ['N400h100T0.8U0.6UM0.4M0gap0.2', 'C']
+scenario_d = ['N400h1000T0.8U0.6UM0.4M0gap0.02', 'D']
+scenario_e = ['N400h100T0.5U0.3UM0.2M0gap0.02', 'E']
+scenario_f = ['N400h100T0.8U0.6UM0.4M0gap0.01', 'F']
+
+def report(s, z):
+
+    path = "/media/olavopoletti/Seagate Expansion Drive/GEI/{}".format(z[0])
+    os.chdir(path)
+
+    pd.set_option('display.float_format', lambda x: "{:,.4f}".format(x))
+
+    check_files = []
+
+    for i in list(range(0, 500)):
+
+        dfP = dd.read_parquet(
+                                '/media/olavopoletti/Seagate Expansion Drive/GEI/{}/players_sim{}_gen{}.parquet'.format(z[0], s, i),
+                                engine = 'fastparquet',
+
+                                )
+
+        dfI = dd.read_parquet(
+                                '/media/olavopoletti/Seagate Expansion Drive/GEI/{}/interactions_sim{}_gen{}.parquet'.format(z[0], s, i),
+                                engine = 'fastparquet',
+
+                                )
+
+        dfPA = dfP.loc[: ,
+                        [
+                        'Player',
+                        'Income_class'
+                        ]
+                        ].rename(
+                                    columns = {
+                                                'Player': 'Player_A',
+                                                'Income_class': 'Income_class_A'
+                                                }
+                                )
+
+        dfI = dd.merge(
+                        dfI,
+                        dfPA,
+                        on = 'Player_A',
+                        how = 'right'
+                        ).dropna()
+
+        dfPA = dfPA.rename(
+                            columns = {
+                                        'Player_A': 'Player_B',
+                                        'Income_class_A': 'Income_class_Counterpart_A'
+                                        }
+                                )
+
+        dfI = dd.merge(
+                        dfI,
+                        dfPA,
+                        on = 'Player_B',
+                        how = 'right'
+                        ).dropna()
+
+        del dfPA
+        gc.collect()
+
+        dfPB = dfP.loc[: ,
+                        [
+                        'Player',
+                        'Income_class'
+                        ]
+                        ].rename(
+                                    columns = {
+                                                'Player': 'Player_B',
+                                                'Income_class': 'Income_class_B'
+                                                }
+                                )
+
+        dfI = dd.merge(
+                        dfI,
+                        dfPB,
+                        on = 'Player_B',
+                        how = 'right'
+                        ).dropna().repartition(partition_size = mem)
+
+        dfPB = dfPB.rename(
+                            columns = {
+                                        'Player_B': 'Player_A',
+                                        'Income_class_B': 'Income_class_Counterpart_B'
+                                        }
+                                )
+
+        dfI = dd.merge(
+                        dfI,
+                        dfPB,
+                        on = 'Player_A',
+                        how = 'right'
+                        ).dropna().repartition(partition_size = mem)
+
+        del dfPB
+        gc.collect()
+
+        dfI = dfI.compute()
+
+        dfI['Coopertation_A'] = ((dfI.Strategy_A.values + dfI.Strategy_B.values) == 'CC').astype(int)
+        dfI['Coopertation_B'] = ((dfI.Strategy_A.values + dfI.Strategy_B.values) == 'CC').astype(int)
+
+        dfI['Temptation_A'] = ((dfI.Strategy_A.values + dfI.Strategy_B.values) == 'DC').astype(int)
+        dfI['Temptation_B'] = ((dfI.Strategy_A.values + dfI.Strategy_B.values) == 'CD').astype(int)
+
+        dfI['Defection_A'] = ((dfI.Strategy_A.values + dfI.Strategy_B.values) == 'DD').astype(int)
+        dfI['Defection_B'] = ((dfI.Strategy_A.values + dfI.Strategy_B.values) == 'DD').astype(int)
+
+        df_tempA = dfI[
+                        [
+                        'Player_A',
+                        'Outcome_A',
+                        'Inters_check',
+                        'Coopertation_A',
+                        'Temptation_A',
+                        'Defection_A',
+                        'Income_class_Counterpart_A'
+                        ]
+                        ].groupby(
+                                    [
+                                    'Player_A',
+                                    'Income_class_Counterpart_A'
+                                    ]
+                                    ).sum()
+
+        df_tempA_link = dfI[
+                            [
+                            'Player_A',
+                            'Link',
+                            'Income_class_Counterpart_A'
+                            ]
+                            ].groupby(
+                                        [
+                                        'Player_A',
+                                        'Income_class_Counterpart_A'
+                                        ]
+                                        ).mean()
+        df_tempA = df_tempA.reset_index()
+        df_tempA = pd.merge(
+                            df_tempA,
+                            df_tempA_link,
+                            on = ['Player_A', 'Income_class_Counterpart_A'],
+                            how = 'right'
+                            )
+        df_tempA['Link_weighted'] = df_tempA.Link.values * df_tempA.Inters_check.values
+        df_tempA = df_tempA.rename(
+                                    columns = {
+                                                'Player_A': 'Player',
+                                                'Outcome_A': 'Partial_Income',
+                                                'Coopertation_A': 'Cooperation',
+                                                'Temptation_A': 'Temptation',
+                                                'Defection_A': 'Defection',
+                                                'Inters_check': 'Connections',
+                                                'Income_class_Counterpart_A': 'Income_class_Counterpart',
+                                                }
+                                                ).sort_values(by = ['Player'])
+
+        df_tempB = dfI[
+                        [
+                        'Player_B',
+                        'Outcome_B',
+                        'Inters_check',
+                        'Coopertation_B',
+                        'Temptation_B',
+                        'Defection_B',
+                        'Income_class_Counterpart_B'
+                        ]
+                        ].groupby(
+                                    [
+                                    'Player_B',
+                                    'Income_class_Counterpart_B'
+                                    ]
+                                    ).sum()
+        df_tempB_link = dfI[
+                            [
+                            'Player_B',
+                            'Link',
+                            'Income_class_Counterpart_B'
+                            ]
+                            ].groupby(
+                                        [
+                                        'Player_B',
+                                        'Income_class_Counterpart_B'
+                                        ]
+                                        ).mean()
+        df_tempB = df_tempB.reset_index()
+        df_tempB = pd.merge(
+                            df_tempB,
+                            df_tempB_link,
+                            on = ['Player_B', 'Income_class_Counterpart_B'],
+                            how = 'right'
+                            )
+        df_tempB['Link_weighted'] = df_tempB.Link.values * df_tempB.Inters_check.values
+        df_tempB = df_tempB.rename(
+                                    columns = {
+                                                'Player_B': 'Player',
+                                                'Outcome_B': 'Partial_Income',
+                                                'Coopertation_B': 'Cooperation',
+                                                'Temptation_B': 'Temptation',
+                                                'Defection_B': 'Defection',
+                                                'Inters_check': 'Connections',
+                                                'Income_class_Counterpart_B':'Income_class_Counterpart',
+                                                }
+                                                ).sort_values(by = ['Player'])
+
+        df_temp = pd.concat([df_tempA, df_tempB]).groupby(['Player', 'Income_class_Counterpart']).sum().reset_index()
+
+        dfP = dfP.compute()
+
+        df = pd.merge(
+                        df_temp,
+                        dfP,
+                        on = ['Player'],
+                        how = 'outer'
+                        )
+
+        df = df.drop(columns = ['Link'])
+        df['Link_Strength'] = df.Link_weighted.values / df.Connections.values
+        df['Cooperation_ratio'] = df.Cooperation.values / df.Connections.values
+        df['Temptation_ratio'] = df.Temptation.values / df.Connections.values
+        df['Defection_ratio'] = df.Defection.values / df.Connections.values
+        df['Effective_Interactions'] = (df.Cooperation.values + df.Temptation.values + df.Defection.values)
+
+        df = df.sort_values(by = ['Player'], ascending = True)
+
+        check_files.append(1)
+
+        appending = len(check_files) != 1
+
+        write(
+                'report_{}.parquet'.format(z[0]),
+                df,
+                file_scheme = 'hive',
+                compression = 'GZIP',
+                object_encoding = 'utf8',
+                append = appending
+                )
+
+report(0, scenario_e)
+
+def report_s(gs, ge, z):
+
+    pd.set_option('display.float_format', lambda x: '%.4f' % x)
+
+    dfS = pd.read_parquet(
+                            '{}//society_{}.parquet'.format(z[0], z[0]),
+                            engine = 'fastparquet',
+
+                            )
+
+    dfS['Generation'] = dfS.Generation.values + np.ones(len(dfS.index))
+
+    dfS['Income_Average_Bottom50'] = ((dfS.Income_Bottom30.values + dfS.Income_Bottom.values)
+                                        / (dfS.Individuals_Bottom30.values + dfS.Individuals_Bottom.values))
+
+    dfS['Income_Average_Top10_Agregate'] = ((dfS.Income_Top01.values + dfS.Income_Top10.values)
+                                        / (dfS.Individuals_Top01.values + dfS.Individuals_Top10.values))
+
+    dfS['Income_Ratio_Bottom50_Top10'] = dfS.Income_Average_Top10_Agregate.values / dfS.Income_Average_Bottom50.values
+
+    dfS['Income_Share_Top10_Agregate'] = ((dfS.Income_Top01.values + dfS.Income_Top10.values)
+                                        / dfS.Income.values)
+
+    dfS['Income_Share_Bottom50'] = ((dfS.Income_Bottom30.values + dfS.Income_Bottom.values)
+                                        / dfS.Income.values)
+
+    dfS['Intrinsic_Average_Bottom50'] = ((dfS.Intrinsic_Bottom30.values + dfS.Intrinsic_Bottom.values)
+                                        / (dfS.Individuals_Bottom30.values + dfS.Individuals_Bottom.values))
+
+    dfS['Intrinsic_Average_Top10_Agregate'] = ((dfS.Intrinsic_Top01.values + dfS.Intrinsic_Top10.values)
+                                        / (dfS.Individuals_Top01.values + dfS.Individuals_Top10.values))
+
+
+    dfS['Intrinsic_Ratio_Bottom50_Top10'] = dfS.Intrinsic_Average_Top10_Agregate.values / dfS.Intrinsic_Average_Bottom50.values
+
+    dfS['Wealth_Average_Bottom50'] = ((dfS.Wealth_Bottom30.values + dfS.Wealth_Bottom.values)
+                                        / (dfS.Individuals_Bottom30.values + dfS.Individuals_Bottom.values))
+
+    dfS['Wealth_Average_Top10_Agregate'] = ((dfS.Wealth_Top01.values + dfS.Wealth_Top10.values)
+                                        / (dfS.Individuals_Top01.values + dfS.Individuals_Top10.values))
+
+    dfS['Wealth_Ratio_Bottom50_Top10'] = dfS.Wealth_Average_Top10_Agregate.values / dfS.Wealth_Average_Bottom50.values
+
+    dfS['Connections_Average_Bottom50'] = ((dfS.Connections_Bottom30.values + dfS.Connections_Bottom.values)
+                                            / (dfS.Individuals_Bottom30.values + dfS.Individuals_Bottom.values))
+
+    dfS['Connections_Average_Top10_Agregate'] = ((dfS.Connections_Top01.values + dfS.Connections_Top10.values)
+                                            / (dfS.Individuals_Top01.values + dfS.Individuals_Top10.values))
+
+    dfS['Cooperation_Average_Bottom50'] = ((dfS.Cooperation_Bottom30.values + dfS.Cooperation_Bottom.values)
+                                            / (dfS.Individuals_Bottom30.values + dfS.Individuals_Bottom.values))
+
+    dfS['Cooperation_Average_Top10_Agregate'] = ((dfS.Cooperation_Top01.values + dfS.Cooperation_Top10.values)
+                                            / (dfS.Individuals_Top01.values + dfS.Individuals_Top10.values))
+
+    dfS['Cooperation_Average_Ratio_Bottom50'] = dfS.Cooperation_Average_Bottom50.values / dfS.Connections_Average_Bottom50.values
+
+    dfS['Cooperation_Average_Ratio_Top10_Agregate'] = dfS.Cooperation_Average_Top10_Agregate.values / dfS.Connections_Average_Top10_Agregate.values
+
+    dfS['Connections_Top10_Agregate'] = (dfS.Connections_Top01.values + dfS.Connections_Top10.values)
+
+    return dfS[(dfS.Generation >= gs) & (dfS.Generation <= ge)][
+                                    [
+                                    'Generation',
+                                    'Income',
+                                    'Income_Share_Top10_Agregate',
+                                    #'Income_Bottom',
+                                    #'Wealth_Bottom',
+                                    #'Intrinsic_Bottom',
+                                    #'Connections_Bottom',
+                                    #'Income_Share_Top10_Agregate',
+                                    #'Income_Share_Bottom50',
+                                    #'Income_Average_Bottom50',
+                                    #'Income_Average_Top01',
+                                    #'Income_Average_Top10_Agregate',
+                                    #'Income_Ratio_Bottom50_Top10',
+                                    #'Intrinsic_Average_Bottom50',
+                                    #'Intrinsic_Average_Top10_Agregate',
+                                    #'Intrinsic_Ratio_Bottom50_Top10',
+                                    #'Connections',
+                                    #'Cooperation',
+                                    #'Wealth_Average_Bottom50',
+                                    #'Wealth_Average_Top10_Agregate',
+                                    #'Wealth_Ratio_Bottom50_Top10',
+                                    #'Connections_Average_Bottom50',
+                                    #'Connections_Average_Top10_Agregate',
+                                    #'Cooperation_Average_Bottom50',
+                                    #'Cooperation_Average_Top10_Agregate',
+                                    #'Cooperation_Average_Ratio_Bottom50',
+                                    #'Cooperation_Average_Ratio_Top10_Agregate',
+                                    #'Connections_Intra_Top10',
+                                    #'Connections_Top10',
+                                    #'Connections_Top10_Agregate',
+                                    ]
+                                    ].sort_values(by=['Income_Share_Top10_Agregate'], ascending = False)
+
+def read_report(gs, ge, z, b):
+
+    pd.set_option('display.float_format', lambda x: "{:,.4f}".format(x))
+
+    df = pd.read_parquet(
+                            '{}//report_{}.parquet'.format(z[0], z[0]),
+                            engine = 'fastparquet',
+                            columns = [
+                                        'Simulation',
+                                        'Generation',
+                                        'Player',
+                                        'Income_class',
+                                        'Income_class_Counterpart',
+                                        'Partial_Income',
+                                        'Connections',
+                                        'Cooperation',
+                                        'Temptation',
+                                        'Defection',
+                                        'Link_weighted',
+                                        ]
+                            ).groupby(
+                                     [
+                                     'Simulation',
+                                     'Generation',
+                                     'Player',
+                                     'Income_class',
+                                     ]
+                                     ).sum().reset_index()
+
+    df_temp = pd.read_parquet(
+                                '{}//report_{}.parquet'.format(z[0], z[0]),
+                                engine = 'fastparquet',
+                                columns = [
+                                            'Simulation',
+                                            'Generation',
+                                            'Player',
+                                            'Income_class',
+                                            'Income_class_Counterpart',
+                                            'Resources',
+                                            'Intrinsic',
+                                            'Income',
+                                            ]
+                                ).groupby(
+                                         [
+                                         'Simulation',
+                                         'Generation',
+                                         'Player',
+                                         'Income_class',
+                                         ]
+                                         ).mean().reset_index()
+
+    df = df.merge(df_temp, on = ['Simulation','Generation','Player','Income_class',], how = 'outer')
+
+    df['Generation'] = df.Generation.values + np.ones(len(df.index))
+
+    df['Link_Strength'] = df.Link_weighted.values / df.Connections.values
+    df['Cooperation_ratio'] = df.Cooperation.values / df.Connections.values
+    df['Temptation_ratio'] = df.Temptation.values / df.Connections.values
+    df['Defection_ratio'] = df.Defection.values / df.Connections.values
+
+    df['key_Previous_Income_class'] = df.Generation.values - np.ones(len(df.index))
+    df['key_Previous_Income_class'] = df['key_Previous_Income_class'].map(str) + df.Player.values
+    df_temp = df[['Generation', 'Player', 'Income_class']]
+    df_temp = df_temp.rename(columns = {'Income_class': 'Previous_Income_class'})
+    df_temp['key_Previous_Income_class'] = df['Generation'].map(str) + df.Player.values
+    df_temp = df_temp.drop(['Generation', 'Player'], axis = 1)
+    df = df.merge(df_temp, on = 'key_Previous_Income_class', how = 'left')
+    df['Moved'] = (df.Previous_Income_class.values != df.Income_class.values).astype('int')
+    del df_temp
+    df = df.drop(['key_Previous_Income_class'], axis = 1)
+
+    df['Resources_Temptation'] = (df.Resources.values * 0.021 * df.Temptation.values) / df.Income.values
+    df['Resources_Cooperation'] = (df.Resources.values * ((0.021 + 0.001) / 2) * df.Cooperation.values) / df.Income.values
+    df['Resources_Competition'] = (df.Resources.values * 0.001 * df.Defection.values) / df.Income.values
+    df['Intrinsic_Temptation'] = (df.Intrinsic.values * 0.021 * df.Temptation.values) / df.Income.values
+    df['Intrinsic_Cooperation'] = (df.Intrinsic.values * ((0.021 + 0.001) / 2) * df.Cooperation.values) / df.Income.values
+    df['Intrinsic_Competition'] = (df.Intrinsic.values * 0.001 * df.Defection.values) / df.Income.values
+
+    df['Agregate'] = df.Income_class.values
+    df.Agregate.replace(
+                        {
+                        'Top01': 'T10',
+                        'Top10': 'T10',
+                        'Top20': 'Middle',
+                        'Top50': 'Middle',
+                        'Bottom30': 'B50',
+                        'Bottom': 'B50',
+                        },
+                        inplace = True
+                        )
+    '''
+    df = df.drop(
+                    columns = [
+                                'Population_Size',
+                                'Intrinsic_Max',
+                                'Transfer_Top01',
+                                'Transfer_Top10',
+                                'Transfer_Top20',
+                                'Transfer_Top50',
+                                'Transfer_Bottom30',
+                                'Transfer_Bottom',
+                                'Payoff_Gap',
+                                'Tag',
+                                ]
+                    )
+
+    df = df.groupby(['Agregate', 'Generation']).mean().reset_index()
+
+    df = df[(df.Agregate == 'T10') | (df.Agregate == 'B50')]
+    '''
+
+    df = df[(df.Generation.values >= gs) & (df.Generation.values <= ge)]
+    df = df[
+                (df.Income_class.values == b)
+                ][[
+                    'Simulation',
+                    'Generation',
+                    'Player',
+                    'Income_class',
+                    'Previous_Income_class',
+                    'Income',
+                    'Partial_Income',
+                    'Resources',
+                    'Intrinsic',
+                    #'Link_Strength',
+                    'Connections',
+                    'Temptation',
+                    'Cooperation_ratio',
+                    'Temptation_ratio',
+                    'Defection_ratio',
+                    'Resources_Temptation',
+                    'Resources_Cooperation',
+                    'Resources_Competition',
+                    'Intrinsic_Temptation',
+                    'Intrinsic_Cooperation',
+                    'Intrinsic_Competition',
+                    #'Moved',
+                    ]].sort_values(by = ['Generation', 'Income'], ascending = [True, False])
+
+    return df
+
+read_report(3, 3, scenario_a, 'Top10')
+
+report_s(100, 200, scenario_a)
