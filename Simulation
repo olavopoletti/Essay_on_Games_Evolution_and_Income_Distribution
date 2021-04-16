@@ -1,0 +1,1116 @@
+import numpy as np
+import pandas as pd
+import time
+import gc
+import warnings
+import itertools as it
+from dask import dataframe as dd
+from dask import array as da
+from dask import delayed
+from fastparquet import write
+from pympler.asizeof import asizeof
+from distributed import Client, progress, LocalCluster
+import os
+
+warnings.simplefilter(
+                        action='ignore',
+                        category=FutureWarning
+                        )
+cluster = LocalCluster()
+client = Client(cluster, processes = False)
+
+
+#Establishes the payoff for each strategy
+dC = 0.021
+dD = 0.001
+payoff_gap = -round(-dC + dD, 2)
+
+payoffs_matrix = {
+                    'DC': dC,
+                    'CC': (dC + dD) / 2,
+                    'DD': dD,
+                    'CD': 0,
+                   }
+
+#Establishes the the limits of intrinsic abilities
+intrinsic_min = 1
+intrinsic_max = 1000
+
+# Portion of wealth tranfered to the next generation
+transfer_top01 = 0.8
+transfer_top10 = 0.6
+transfer_top20 = 0.4
+transfer_top50 = 0
+transfer_bottom30 = 0
+transfer_bottom = 0
+
+transfer = {
+            'Top01' : transfer_top01,
+            'Top10' : transfer_top10,
+            'Top20' : transfer_top20,
+            'Top50' : transfer_top50,
+            'Bottom30' : transfer_bottom30,
+            'Bottom' : transfer_bottom,
+            }
+
+income_brackets = [
+                    'Top01',
+                    'Top10',
+                    'Top20',
+                    'Top50',
+                    'Bottom30',
+                    'Bottom'
+                    ]
+
+population_size = 400
+depreciation_rate = 0.1
+
+# Number of simulations
+simulations = list(range(0, 1))
+# Number of gennerations in each simulation
+generations = list(range(0, 500))
+
+mem = '500MB' #partition_size
+mem_target = 100000
+
+# Characterization of each generation
+tag = str(
+        'N' + str(population_size)
+        + 'h' + str(intrinsic_max)
+        + 'T' + str(transfer_top01)
+        + 'U' + str(transfer_top10)
+        + 'UM' + str(transfer_top20)
+        + 'M' + str(transfer_top50)
+        + 'gap' + str(payoff_gap)
+        )
+
+# Breakes the simulation into batches to avoid overloading the memory
+def batches(length):
+
+    target = 250000
+
+    a = -1
+    b = (2 * len(length) - 1)
+    c = - 2 * target
+
+    delta = b ** 2 - 4 * a * c
+
+    if delta > 0:
+
+        return int(round((- b + delta ** 0.5) / (2 * a)))
+
+    else:
+        return target
+
+# Gini index
+def gini(array):
+    """Calculate the Gini coefficient of a numpy array."""
+    # based on bottom eq: http://www.statsdirect.com/help/content/image/stat0206_wmf.gif
+    # from: http://www.statsdirect.com/help/default.htm#nonparametric_methods/gini.htm
+    array = array.flatten() #all values are treated equally, arrays must be 1d
+    if np.amin(array) < 0:
+        array -= np.amin(array) #values cannot be negative
+    array += 0.0000001 #values cannot be 0
+    array = np.sort(array) #values must be sorted
+    index = np.arange(1,array.shape[0]+1) #index per array element
+    n = array.shape[0]#number of array elements
+    return ((np.sum((2 * index - n  - 1) * array)) / (n * np.sum(array))) #Gini coefficient
+
+# creates the dataframe with the first individuals of the society
+def seed(s):
+
+    df = pd.DataFrame()
+
+    df['P'] = ['P'] * (population_size)
+    df['N'] = list(range(0, population_size ))
+    df['N'] = df.N.astype('str')
+    df['Player'] = df['P'] + df['N']
+
+    df = df.drop(['P', 'N'], axis = 1)
+
+    df['Resources'] = np.ones(population_size)
+    #df['Resources'] = [np.random.randint(0,300) for i in range(population_size)]
+    df.Resources = df.Resources.astype('float32')
+
+    df.to_parquet(
+                'players_sim{}_gen0.parquet'.format(s),
+                engine = 'fastparquet',
+                compression = 'GZIP'
+                    )
+    del df
+    gc.collect()
+
+# attributes intrinsic characteristics to each individual
+def intrinsic(s, g):
+
+    df = pd.read_parquet(
+                        'players_sim{}_gen{}.parquet'.format(s, g),
+                        engine = 'fastparquet'
+                        )
+    df['Intrinsic'] = np.random.randint(
+                                        low = intrinsic_min,
+                                        high = intrinsic_max,
+                                        size = len(df.index)
+                                        ) # discrete uniform distribution
+    df.Intrinsic = df.Intrinsic.astype('float32')
+
+    df.to_parquet(
+                'players_sim{}_gen{}.parquet'.format(s, g),
+                engine = 'fastparquet',
+                compression = 'GZIP',
+                    )
+    del df
+    gc.collect()
+
+
+# establishes the links between players and strength of those links
+def interactions(s, g):
+
+    start = time.time()
+
+    df = pd.read_parquet(
+                        'players_sim{}_gen{}.parquet'.format(s, g),
+                        engine = 'fastparquet',
+                        columns = [
+                                    'Player',
+                                    'Resources',
+                                    'Intrinsic'
+                                    ]
+                        )
+
+    lp = list(range(0, len(df.index)))
+
+    size = batches(lp)
+
+    lp_temp = list(range(0, len(df.index) - 1))
+    ipA = (lp_temp[i:i + size] for i in range(0,len(lp_temp), size))
+    ipA_temp = (lp_temp[i:i + size] for i in range(0,len(lp_temp), size))
+
+    ipB = ([list(range(j + 1, len(lp)))for j in i ]for i in ipA_temp)
+
+    rlp = list(range(1, len(df.index)))
+    rlp.reverse()
+    repetitions = (rlp[i:i + size] for i in range(0,len(rlp), size))
+
+    check_files = []
+
+    for k in zip(ipA, repetitions, ipB):
+
+        df_temp = df.loc[k[0], :]
+
+        df_temp2 = pd.merge(
+                            df_temp.Player.repeat(k[1]).reset_index().drop(['index'], axis = 1),
+                            df_temp.Resources.repeat(k[1]).reset_index().drop(['index'], axis = 1),
+                            left_index = True,
+                            right_index = True
+                            )
+
+        df_temp2 = pd.merge(
+                            df_temp2,
+                            df_temp.Intrinsic.repeat(k[1]).reset_index(),
+                            left_index = True,
+                            right_index = True
+                            )
+
+        del df_temp
+
+        df_temp3 = pd.concat(
+                            [df.loc[i, :] for i in k[2]]
+                                ).reset_index().drop(['index'], axis = 1)
+
+        df_temp2 = df_temp2.rename(
+                                    columns = {
+                                                'Player': 'Player_A',
+                                                'Resources': 'Resources_A',
+                                                'Intrinsic': 'Intrinsic_A'
+                                                }
+                                    )
+
+        df_temp3 = df_temp3.rename(
+                                    columns = {
+                                                'Player': 'Player_B',
+                                                'Resources': 'Resources_B',
+                                                'Intrinsic': 'Intrinsic_B'
+                                                }
+                                    )
+
+        df_temp4 = pd.merge(
+                            df_temp2,
+                            df_temp3,
+                            left_index = True,
+                            right_index = True
+                            )
+
+        df_temp4['Link'] = 1 - (
+                            (((df_temp4['Resources_A'] - df_temp4['Resources_B']) ** 2 ) ** 0.5)
+                                /(df_temp4['Resources_A'] + df_temp4['Resources_B'])
+                            )
+
+        df_temp4['Inters_check'] = np.random.binomial(
+                                                    n = 1,
+                                                    p = df_temp4.Link.values
+                                                    ).astype('int16')
+
+        df_temp5 = df_temp4[df_temp4['Inters_check'] == 1]
+
+        del df_temp2
+        del df_temp3
+        del df_temp4
+        gc.collect()
+
+        players = df.Player.values
+
+        df['Neighbours'] = [
+                            set(
+                                df_temp5.Player_B[df_temp5.Player_A == i].values.tolist()
+                                +
+                                df_temp5.Player_A[df_temp5.Player_B == i].values.tolist()
+                                )
+
+                            for i in players
+                            ]
+
+        dfPlayers_temp = df[['Player', 'Neighbours']]
+
+        df_temp5 = pd.merge(df_temp5, dfPlayers_temp, left_on='Player_A', right_on='Player')
+        df_temp5 = df_temp5.drop(columns = ['Player'])
+        df_temp5 = df_temp5.rename(columns = {'Neighbours': 'Neighbours_A'})
+        df_temp5 = pd.merge(df_temp5, dfPlayers_temp, left_on='Player_B', right_on='Player')
+        df_temp5 = df_temp5.drop(columns = ['Player'])
+        df_temp5 = df_temp5.rename(columns = {'Neighbours': 'Neighbours_B'})
+
+        del dfPlayers_temp
+        del players
+        gc.collect()
+
+        df_temp5['Shared_Neighbours_set'] = df_temp5.Neighbours_A.values & df_temp5.Neighbours_B.values
+        df_temp5['Total_Neighbours_set'] = df_temp5.Neighbours_A.values | df_temp5.Neighbours_B.values
+
+        df_temp5['Shared_Neighbours'] = df_temp5.Shared_Neighbours_set.apply(len)
+        df_temp5['Total_Neighbours'] = df_temp5.Total_Neighbours_set.apply(len) - 2
+
+        df_temp5 = df_temp5.drop(
+                                columns = [
+                                            'Neighbours_A',
+                                            'Neighbours_B',
+                                            'Shared_Neighbours_set',
+                                            'Total_Neighbours_set'
+                                            ]
+                                )
+
+        df_temp5['Link_strenght_A'] = (
+                                        df_temp5.Shared_Neighbours/df_temp5.Total_Neighbours
+                                        )
+
+        df_temp5['Link_strenght_B'] =  df_temp5.Link_strenght_A.values
+
+        df_temp5['Strategy_A'] = np.random.binomial(
+                                        n = 1,
+                                        p = df_temp5.Link_strenght_A.values
+                                        ).astype('int16')
+
+        df_temp5['Strategy_B'] = np.random.binomial(
+                                        n = 1,
+                                        p = df_temp5.Link_strenght_B.values
+                                        ).astype('int16')
+
+        df_temp5.Strategy_A.replace({0: 'D', 1: 'C'}, inplace = True)
+        df_temp5.Strategy_B.replace({0: 'D', 1: 'C'}, inplace = True)
+
+        df_temp5['Payoff_A'] = df_temp5.Strategy_A + df_temp5.Strategy_B
+        df_temp5['Payoff_B'] = df_temp5.Strategy_B + df_temp5.Strategy_A
+
+        df_temp5.Payoff_A.replace(payoffs_matrix, inplace = True)
+        df_temp5.Payoff_B.replace(payoffs_matrix, inplace = True)
+
+        df_temp5.Payoff_A = df_temp5.Payoff_A.astype('float32')
+        df_temp5.Payoff_B = df_temp5.Payoff_B.astype('float32')
+
+        df_temp5['Outcome_A'] = (df_temp5.Resources_A + df_temp5.Intrinsic_A) * df_temp5.Payoff_A
+        df_temp5['Outcome_B'] = (df_temp5.Resources_B + df_temp5.Intrinsic_B) * df_temp5.Payoff_B
+
+        check_files.append(1)
+
+        appending = len(check_files) != 1
+
+        write(
+                'interactions_sim{}_gen{}.parquet'.format(s, g),
+                df_temp5,
+                file_scheme = 'hive',
+                compression = 'GZIP',
+                object_encoding = 'utf8',
+                append = appending
+                )
+
+        del df_temp5
+        gc.collect()
+        client.restart()
+
+    end = time.time()
+    print(end - start)
+
+client.restart()
+
+# income obtained from economic interactions with other individuals
+def income(s, g):
+
+    #start = time.time()
+
+    dfIA = dd.read_parquet(
+                            'interactions_sim{}_gen{}.parquet'.format(s, g),
+                            engine = 'fastparquet',
+                            columns = [
+                                        'Player_A',
+                                        'Outcome_A'
+                                        ]
+                            ).rename(
+                            columns = {
+                                        'Player_A': 'Player',
+                                        'Outcome_A': 'Income'
+                                        }
+                            ).groupby(
+                                        [
+                                        'Player'
+                                        ]
+                                        #,as_index=False
+                                        ).sum().repartition(partition_size = mem_target)
+
+    dfIA = dfIA.repartition(npartitions = 1+dfIA.memory_usage(deep=True).sum().compute() // mem_target)
+
+    dfIB = dd.read_parquet(
+                            'interactions_sim{}_gen{}.parquet'.format(s, g),
+                            engine = 'fastparquet',
+                            columns = [
+                                        'Player_B',
+                                        'Outcome_B'
+                                        ]
+                            ).rename(
+                            columns = {
+                                        'Player_B': 'Player',
+                                        'Outcome_B': 'Income'
+                                        }
+                            ).groupby(
+                                        [
+                                        'Player'
+                                        ]
+                                        #,as_index=False
+                                        ).sum().repartition(partition_size = mem_target)
+    dfIA = dfIA.repartition(npartitions = 1 + dfIA.memory_usage(deep=True).sum().compute() // mem_target)
+
+    dfI = pd.concat(
+                    [
+                    dfIA.compute().reset_index(),
+                    dfIB.compute().reset_index()
+                    ],
+                    axis = 0,
+                    ignore_index = True
+                    ).groupby(
+                                [
+                                'Player'
+                                ],
+                                as_index = False
+                                ).sum()
+
+    del dfIA
+    del dfIB
+    gc.collect()
+
+    dfP = pd.read_parquet(
+                            'players_sim{}_gen{}.parquet'.format(s, g),
+                            engine = 'fastparquet'
+                            )
+    df = pd.merge(
+                    dfP,
+                    dfI,
+                    how = 'outer',
+                    on = 'Player'
+                    )
+
+    df = df.fillna(0)
+
+    del dfP
+    del dfI
+    gc.collect()
+
+    top01 = df['Income'].quantile(.99)
+    top10 = df['Income'].quantile(.90)
+    top20 = df['Income'].quantile(.80)
+    top50 = df['Income'].quantile(.50)
+    bottom30 = df['Income'].quantile(.30)
+
+    df['Income_ratio'] = df.Income/df.Income.mean()
+    df.Income_ratio = df.Income_ratio.astype('float32')
+    conditions =[
+                (df['Income'] >= top01),
+                (df['Income'] >= top10) & (df['Income'] < top01),
+                (df['Income'] >= top20) & (df['Income'] < top10),
+                (df['Income'] >= top50) & (df['Income'] < top20),
+                (df['Income'] >= bottom30) & (df['Income'] < top50),
+                (df['Income'] < bottom30),
+                ]
+
+    classes = [
+                'Top01',
+                'Top10',
+                'Top20',
+                'Top50',
+                'Bottom30',
+                'Bottom'
+                ]
+
+    df['Income_class'] = np.select(
+                                    conditions,
+                                    classes,
+                                    default = 'error'
+                                    )
+
+    df['Tag'] = np.repeat(tag, population_size)
+    df['Simulation'] = np.repeat(s, population_size)
+    df['Generation'] = np.repeat(g, population_size)
+    df['Population_Size'] = np.repeat(population_size, population_size)
+    df['Intrinsic_Max'] = np.repeat(intrinsic_max, population_size)
+    df['Transfer_Top01'] = np.repeat(transfer_top01, population_size)
+    df['Transfer_Top10'] = np.repeat(transfer_top10, population_size)
+    df['Transfer_Top20'] = np.repeat(transfer_top20, population_size)
+    df['Transfer_Top50'] = np.repeat(transfer_top50, population_size)
+    df['Transfer_Bottom30'] = np.repeat(transfer_bottom30, population_size)
+    df['Transfer_Bottom'] = np.repeat(transfer_bottom, population_size)
+    df['Payoff_Gap'] = np.repeat(payoff_gap, population_size)
+
+    df.to_parquet(
+                'players_sim{}_gen{}.parquet'.format(s, g),
+                engine = 'fastparquet',
+                compression = 'GZIP',
+                    )
+
+    gc.collect()
+
+    #end = time.time()
+    #print(end - start)
+
+# defines the resources transmited to the next generation
+def bequest(s, g):
+
+    #start = time.time()
+
+    df = pd.read_parquet(
+                            'players_sim{}_gen{}.parquet'.format(s, g),
+                            engine = 'fastparquet',
+                            columns = [
+                                        'Player',
+                                        'Resources',
+                                        'Income',
+                                        'Income_class'
+                                        ]
+                            )
+
+    df = df.replace(transfer)
+
+    df['Resources_adjusted'] = df.Resources.values * (1 - depreciation_rate)
+    df['Income_adjusted'] = df.Income.values * df.Income_class.values
+
+    df['Resources'] = df['Resources_adjusted'] + df['Income_adjusted']
+
+    df = df.drop([
+                    'Income',
+                    'Income_class',
+                    'Resources_adjusted',
+                    'Income_adjusted'
+                    ],
+                    axis = 1
+                    )
+
+    df.to_parquet(
+                'players_sim{}_gen{}.parquet'.format(s, g + 1),
+                engine = 'fastparquet',
+                compression = 'GZIP',
+                    )
+
+    del df
+    gc.collect()
+
+    #end = time.time()
+    #print(end - start)
+
+# Consolidates the data
+def society(s, g):
+
+    #path = "/media/olavopoletti/Seagate Expansion Drive/GEI/{}".format(tag)
+    #os.chdir(path)
+
+    pre_df = []
+
+    for sim in s:
+
+        for gen in g:
+
+            dfP = dd.read_parquet(
+                                    'players_sim{}_gen{}.parquet'.format(sim, gen),
+                                    engine = 'fastparquet',
+                                    columns = [
+                                                'Player',
+                                                'Resources',
+                                                'Intrinsic',
+                                                'Income',
+                                                'Income_class',
+                                                'Tag',
+                                                'Simulation',
+                                                'Generation',
+                                                'Population_Size',
+                                                'Intrinsic_Max',
+                                                'Transfer_Top01',
+                                                'Transfer_Top10',
+                                                'Transfer_Top20',
+                                                'Transfer_Top50',
+                                                'Transfer_Bottom30',
+                                                'Transfer_Bottom',
+                                                'Payoff_Gap'
+                                                ]
+                                    ) #.repartition(partition_size = mem)
+
+            dfI = dd.read_parquet(
+                                    'interactions_sim{}_gen{}.parquet'.format(sim, gen),
+                                    engine = 'fastparquet',
+                                    columns =[
+                                                'Player_A',
+                                                'Player_B',
+                                                'Strategy_A',
+                                                'Strategy_B',
+                                                'Link_strenght_A',
+                                                ]
+                                    ) #.repartition(partition_size = mem)
+
+            dfPA = dfP.loc[: ,
+                            [
+                            'Player',
+                            'Income_class'
+                            ]
+                            ].rename(
+                                        columns = {
+                                                    'Player': 'Player_A',
+                                                    'Income_class': 'Income_class_A'
+                                                    }
+                                    )
+
+
+            dfI = dd.merge(
+                            dfI,
+                            dfPA,
+                            on = 'Player_A',
+                            how = 'right'
+                            ).dropna()
+
+            del dfPA
+            gc.collect()
+
+            dfPB = dfP.loc[: ,
+                            [
+                            'Player',
+                            'Income_class'
+                            ]
+                            ].rename(
+                                        columns = {
+                                                    'Player': 'Player_B',
+                                                    'Income_class': 'Income_class_B'
+                                                    }
+                                    )
+
+            dfI = dd.merge(
+                            dfI,
+                            dfPB,
+                            on = 'Player_B',
+                            how = 'right'
+                            ).dropna().repartition(partition_size = mem)
+
+            del dfPB
+            gc.collect()
+
+            dfP = dfP.compute()
+            dfI = dfI.compute()
+
+            sim_gen = [
+                        dfP['Tag'].iloc[0],
+                        dfP['Simulation'].iloc[0],
+                        dfP['Generation'].iloc[0],
+                        dfP['Population_Size'].iloc[0],
+                        dfP['Intrinsic_Max'].iloc[0],
+                        dfP['Transfer_Top01'].iloc[0],
+                        dfP['Transfer_Top10'].iloc[0],
+                        dfP['Transfer_Top20'].iloc[0],
+                        dfP['Transfer_Top50'].iloc[0],
+                        dfP['Transfer_Bottom30'].iloc[0],
+                        dfP['Transfer_Bottom'].iloc[0],
+                        dfP['Payoff_Gap'].iloc[0],
+                        dfP.Player.count(),
+                        dfI.Strategy_A.count(),
+                        dfI.Player_A[
+                                    (dfI['Strategy_A'] == 'C')
+                                    &
+                                    (dfI['Strategy_B'] == 'C')
+                                    ].count(),
+                        dfI.Player_A[
+                                    (dfI['Strategy_A'] == 'D')
+                                    &
+                                    (dfI['Strategy_B'] == 'D')
+                                    ].count(),
+                        dfP.Resources.sum(),
+                        dfP.Resources.mean(),
+                        dfP.Resources.std(),
+                        dfP.Intrinsic.sum(),
+                        dfP.Intrinsic.mean(),
+                        dfP.Intrinsic.std(),
+                        dfP.Income.sum(),
+                        dfP.Income.mean(),
+                        dfP.Income.std(),
+                        gini(dfP.Income.values),
+                        dfI.Link_strenght_A.mean(),
+                        dfI.Link_strenght_A.std(),
+                        ]
+
+            pre_df.append(sim_gen)
+
+
+            for iB in ['Top01', 'Top10', 'Top20', 'Top50', 'Bottom30', 'Bottom']:
+
+                if dfP.Player[dfP.Income_class == iB].count() == 0:
+
+                    for zero in np.zeros(23):
+                        sim_gen.append(zero)
+
+                else:
+
+                    sim_gen.append(
+                                    dfP.Player[dfP.Income_class == iB].count()
+                                    ) # number of players
+                    sim_gen.append(
+                                    dfI.Strategy_A[
+                                                    (dfI.Income_class_A == iB)
+                                                    |
+                                                    (dfI.Income_class_B == iB)
+                                                    ].count() # number of interactions
+
+                                    )
+                    sim_gen.append(
+                                    dfI.Strategy_A[
+                                                    (
+                                                        (dfI.Strategy_A == 'C')
+                                                        &
+                                                        (dfI.Strategy_B == 'C')
+                                                    )
+                                                    &
+                                                    (
+                                                        (dfI.Income_class_A == iB)
+                                                        |
+                                                        (dfI.Income_class_B == iB)
+                                                        )
+                                                    ].count()
+                                    ) # number of cooperative interactions
+
+                    sim_gen.append(
+                                    dfI.Strategy_A[
+                                                    (
+                                                        (dfI.Strategy_A == 'D')
+                                                        &
+                                                        (dfI.Strategy_B == 'D')
+                                                    )
+                                                    &
+                                                    (
+                                                        (dfI.Income_class_A == iB)
+                                                        |
+                                                        (dfI.Income_class_B == iB)
+                                                        )
+                                                    ].count()
+                                    ) # number of double defections
+
+                    sim_gen.append(
+                                    dfI.Strategy_A[
+                                                    (
+                                                        (dfI.Strategy_A == 'D')
+                                                        &
+                                                        (dfI.Strategy_B == 'C')
+                                                    )
+                                                    &
+                                                    (
+                                                        (dfI.Income_class_A == iB)
+                                                        )
+                                                    ].count()
+
+                                    +
+
+                                    dfI.Strategy_A[
+                                                    (
+                                                        (dfI.Strategy_A == 'C')
+                                                        &
+                                                        (dfI.Strategy_B == 'D')
+                                                    )
+                                                    &
+                                                    (
+                                                        (dfI.Income_class_B == iB)
+                                                        )
+                                                    ].count()
+                                    ) # number of temptation payoffs
+
+                    sim_gen.append(
+                                    dfI.Strategy_A[
+                                                    (dfI.Income_class_A == iB)
+                                                    &
+                                                    (dfI.Income_class_B == iB)
+                                                    ].count()# number interactions within the income class
+                                    )
+                    sim_gen.append(
+                                    dfI.Strategy_A[
+                                                    (
+                                                        (dfI.Strategy_A == 'C')
+                                                        &
+                                                        (dfI.Strategy_B == 'C')
+                                                    )
+                                                    &
+                                                    (
+                                                        (dfI.Income_class_A == iB)
+                                                        &
+                                                        (dfI.Income_class_B == iB)
+                                                        )
+                                                    ].count()
+                                    ) # number of cooperative interaction within income class
+
+
+                    sim_gen.append(
+                                    dfI.Strategy_A[
+                                                    (
+                                                        (dfI.Strategy_A == 'D')
+                                                        &
+                                                        (dfI.Strategy_B == 'D')
+                                                    )
+                                                    &
+                                                    (
+                                                        (dfI.Income_class_A == iB)
+                                                        &
+                                                        (dfI.Income_class_B == iB)
+                                                        )
+                                                    ].count()
+                                    ) # number of double defections within income class
+
+                    sim_gen.append(
+                                    dfI.Strategy_A[
+                                                    (
+                                                        (
+                                                        (dfI.Strategy_A == 'C')
+                                                        &
+                                                        (dfI.Strategy_B == 'D')
+
+                                                        |
+
+                                                        (dfI.Strategy_A == 'D')
+                                                        &
+                                                        (dfI.Strategy_B == 'C')
+                                                        )
+                                                    )
+                                                    &
+                                                    (
+                                                        (dfI.Income_class_A == iB)
+                                                        &
+                                                        (dfI.Income_class_B == iB)
+                                                        )
+                                                    ].count()
+                                    ) # number of temptation payoffs within income class
+
+                    sim_gen.append(
+                                    dfP.Resources[
+                                                    dfP.Income_class == iB
+                                                    ].sum()
+                                    ) # total of resources possessed by the income class
+                    sim_gen.append(
+                                    dfP.Resources[
+                                                    dfP.Income_class == iB
+                                                    ].mean()
+                                    ) # average resources possessed by the income class
+                    sim_gen.append(
+                                    dfP.Resources[
+                                                    dfP.Income_class == iB
+                                                    ].std()
+                                    ) # standard deviation of the resources possessed by the income class
+                    sim_gen.append(
+                                    dfP.Intrinsic[
+                                                    dfP.Income_class == iB
+                                                    ].sum()
+                                    )
+                    sim_gen.append(
+                                    dfP.Intrinsic[
+                                                    dfP.Income_class == iB
+                                                    ].mean()
+                                                    )
+                    sim_gen.append(
+                                    dfP.Intrinsic[
+                                                    dfP.Income_class == iB
+                                                    ].std()
+                                    )
+                    sim_gen.append(
+                                    dfP.Income[
+                                                dfP.Income_class == iB
+                                                ].sum()
+                                    )
+                    sim_gen.append(
+                                    dfP.Income[
+                                                dfP.Income_class == iB
+                                                ].mean()
+                                    )
+                    sim_gen.append(
+                                    dfP.Income[
+                                                dfP.Income_class == iB
+                                                ].std()
+                                    )
+                    sim_gen.append(
+                                    gini(
+                                            dfP.Income[
+                                                        dfP.Income_class == iB
+                                                        ].values)
+                                    )
+
+                    sim_gen.append(
+                                    dfI.Link_strenght_A[
+                                                    (dfI.Income_class_A == iB)
+                                                    &
+                                                    (dfI.Income_class_B == iB)
+                                                    ].mean()# link strength within the income class
+                                    )
+
+                    sim_gen.append(
+                                    dfI.Link_strenght_A[
+                                                    (dfI.Income_class_A == iB)
+                                                    &
+                                                    (dfI.Income_class_B == iB)
+                                                    ].std()# link strength within the income class
+                                    )
+
+                    sim_gen.append(
+                                    dfI.Link_strenght_A[
+                                                    (dfI.Income_class_A == iB)
+                                                    |
+                                                    (dfI.Income_class_B == iB)
+                                                    ].mean()# link strength
+                                    )
+
+                    sim_gen.append(
+                                    dfI.Link_strenght_A[
+                                                    (dfI.Income_class_A == iB)
+                                                    |
+                                                    (dfI.Income_class_B == iB)
+                                                    ].std()# link strength
+                                    )
+            del sim_gen
+            gc.collect()
+
+    society_df = pd.DataFrame(
+                                pre_df,
+                            columns = [
+                                    'Tag',
+                                    'Simulation',
+                                    'Generation',
+                                    'Population_Size',
+                                    'Intrinsic_Max',
+                                    'Transfer_Top01',
+                                    'Transfer_Top10',
+                                    'Transfer_Top20',
+                                    'Transfer_Top50',
+                                    'Transfer_Bottom30',
+                                    'Transfer_Bottom',
+                                    'Payoff_Gap',
+                                    'Individuals',
+                                    'Connections',
+                                    'Cooperation',
+                                    'Defection',
+                                    'Wealth',
+                                    'Wealth_Average',
+                                    'Wealth_Std',
+                                    'Intrinsic',
+                                    'Intrinsic_Average',
+                                    'Intrinsic_Std',
+                                    'Income',
+                                    'Income_Average',
+                                    'Income_Std',
+                                    'Gini',
+                                    'Link_Strenght_Average',
+                                    'Link_Strenght_Std',
+
+                                    'Individuals_Top01',
+                                    'Connections_Top01',
+                                    'Cooperation_Top01',
+                                    'Defection_Top01',
+                                    'Temptation_Top01',
+                                    'Connections_Intra_Top01',
+                                    'Cooperation_Intra_Top01',
+                                    'Defection_Intra_Top01',
+                                    'Temptation_Intra_Top01',
+                                    'Wealth_Top01',
+                                    'Wealth_Average_Top01',
+                                    'Wealth_Std_Top01',
+                                    'Intrinsic_Top01',
+                                    'Intrinsic_Average_Top01',
+                                    'Intrinsic_Std_Top01',
+                                    'Income_Top01',
+                                    'Income_Average_Top01',
+                                    'Income_Std_Top01',
+                                    'Gini_Top01',
+                                    'Link_Strenght_Average_Top01_Intra',
+                                    'Link_Strenght_Std_Top01_Intra',
+                                    'Link_Strenght_Average_Top01',
+                                    'Link_Strenght_Std_Top01',
+
+                                    'Individuals_Top10',
+                                    'Connections_Top10',
+                                    'Cooperation_Top10',
+                                    'Defection_Top10',
+                                    'Temptation_Top10',
+                                    'Connections_Intra_Top10',
+                                    'Cooperation_Intra_Top10',
+                                    'Defection_Intra_Top10',
+                                    'Temptation_Intra_Top10',
+                                    'Wealth_Top10',
+                                    'Wealth_Average_Top10',
+                                    'Wealth_Std_Top10',
+                                    'Intrinsic_Top10',
+                                    'Intrinsic_Average_Top10',
+                                    'Intrinsic_Std_Top10',
+                                    'Income_Top10',
+                                    'Income_Average_Top10',
+                                    'Income_Std_Top10',
+                                    'Gini_Top10',
+                                    'Link_Strenght_Average_Top10_Intra',
+                                    'Link_Strenght_Std_Top10_Intra',
+                                    'Link_Strenght_Average_Top10',
+                                    'Link_Strenght_Std_Top10',
+
+                                    'Individuals_Top20',
+                                    'Connections_Top20',
+                                    'Cooperation_Top20',
+                                    'Defection_Top20',
+                                    'Temptation_Top20',
+                                    'Connections_Intra_Top20',
+                                    'Cooperation_Intra_Top20',
+                                    'Defection_Intra_Top20',
+                                    'Temptation_Intra_Top20',
+                                    'Wealth_Top20',
+                                    'Wealth_Average_Top20',
+                                    'Wealth_Std_Top20',
+                                    'Intrinsic_Top20',
+                                    'Intrinsic_Average_Top20',
+                                    'Intrinsic_Std_Top20',
+                                    'Income_Top20',
+                                    'Income_Average_Top20',
+                                    'Income_Std_Top20',
+                                    'Gini_Top20',
+                                    'Link_Strenght_Average_Top20_Intra',
+                                    'Link_Strenght_Std_Top20_Intra',
+                                    'Link_Strenght_Average_Top20',
+                                    'Link_Strenght_Std_Top20',
+
+                                    'Individuals_Top50',
+                                    'Connections_Top50',
+                                    'Cooperation_Top50',
+                                    'Defection_Top50',
+                                    'Temptation_Top50',
+                                    'Connections_Intra_Top50',
+                                    'Cooperation_Intra_Top50',
+                                    'Defection_Intra_Top50',
+                                    'Temptation_Intra_Top50',
+                                    'Wealth_Top50',
+                                    'Wealth_Average_Top50',
+                                    'Wealth_Std_Top50',
+                                    'Intrinsic_Top50',
+                                    'Intrinsic_Average_Top50',
+                                    'Intrinsic_Std_Top50',
+                                    'Income_Top50',
+                                    'Income_Average_Top50',
+                                    'Income_Std_Top50',
+                                    'Gini_Top50',
+                                    'Link_Strenght_Average_Top50_Intra',
+                                    'Link_Strenght_Std_Top50_Intra',
+                                    'Link_Strenght_Average_Top50',
+                                    'Link_Strenght_Std_Top50',
+
+                                    'Individuals_Bottom30',
+                                    'Connections_Bottom30',
+                                    'Cooperation_Bottom30',
+                                    'Defection_Bottom30',
+                                    'Temptation_Bottom30',
+                                    'Connections_Intra_Bottom30',
+                                    'Cooperation_Intra_Bottom30',
+                                    'Defection_Intra_Bottom30',
+                                    'Temptation_Intra_Bottom30',
+                                    'Wealth_Bottom30',
+                                    'Wealth_Average_Bottom30',
+                                    'Wealth_Std_Bottom30',
+                                    'Intrinsic_Bottom30',
+                                    'Intrinsic_Average_Bottom30',
+                                    'Intrinsic_Std_Bottom30',
+                                    'Income_Bottom30',
+                                    'Income_Average_Bottom30',
+                                    'Income_Std_Bottom30',
+                                    'Gini_Bottom30',
+                                    'Link_Strenght_Average_Bottom30_Intra',
+                                    'Link_Strenght_Std_Bottom30_Intra',
+                                    'Link_Strenght_Average_Bottom30',
+                                    'Link_Strenght_Std_Bottom30',
+
+                                    'Individuals_Bottom',
+                                    'Connections_Bottom',
+                                    'Cooperation_Bottom',
+                                    'Defection_Bottom',
+                                    'Temptation_Bottom',
+                                    'Connections_Intra_Bottom',
+                                    'Cooperation_Intra_Bottom',
+                                    'Defection_Intra_Bottom',
+                                    'Temptation_Intra_Bottom',
+                                    'Wealth_Bottom',
+                                    'Wealth_Average_Bottom',
+                                    'Wealth_Std_Bottom',
+                                    'Intrinsic_Bottom',
+                                    'Intrinsic_Average_Bottom',
+                                    'Intrinsic_Std_Bottom',
+                                    'Income_Bottom',
+                                    'Income_Average_Bottom',
+                                    'Income_Std_Bottom',
+                                    'Gini_Bottom',
+                                    'Link_Strenght_Average_Bottom_Intra',
+                                    'Link_Strenght_Std_Bottom_Intra',
+                                    'Link_Strenght_Average_Bottom',
+                                    'Link_Strenght_Std_Bottom',
+
+                                    ]
+                            )
+
+    society_df.to_parquet('society_{}.parquet'.format(tag),
+                            engine = 'fastparquet',
+                            compression = 'GZIP',
+                            )
+    client.restart()
+
+# Runs the simulation
+def game(s, g):
+
+    start = time.time()
+
+    path = "/media/olavopoletti/Seagate Expansion Drive/GEI/{}".format(tag)
+    os.mkdir(path)
+    os.chdir(path)
+
+    for sim in s:
+
+        seed(sim)
+
+        for gen in g:
+
+            intrinsic(sim, gen)
+            interactions(sim, gen)
+            income(sim, gen)
+            bequest(sim, gen)
+            client.restart()
+
+    society(s, g)
+
+    end = time.time()
+    print((end - start)/60)
+
+game(simulations, generations)
+society(simulations, generations)
+client.restart()
